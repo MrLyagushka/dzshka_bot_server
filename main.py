@@ -1,14 +1,11 @@
 import sqlite3
-import hashlib
-import hmac
 import json
-import urllib.parse
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# Разрешаем запросы с фронтенда (в продакшене укажите свой домен вместо "*")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,29 +14,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BOT_TOKEN = "8414515759:AAHLFS38Qj4vedykAbJSDUSu-0zqRYDK6c0"  # ← Замените на токен от @BotFather
-
-def verify_telegram_init_data(init_data: str) -> dict:
-    """Валидация подписи Telegram (обязательно для продакшена)"""
-    parsed = dict(urllib.parse.parse_qsl(init_data))
-    hash_ = parsed.pop('hash')
-    # Сортируем ключи и собираем строку для проверки
-    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
-    # Секретный ключ = SHA256(BOT_TOKEN)
-    secret_key = hashlib.sha256(BOT_TOKEN.encode()).digest()
-    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-    
-    if not hmac.compare_digest(computed_hash, hash_):
-        raise HTTPException(status_code=403, detail="Неверная подпись Telegram")
-    return parsed
-
 def get_db():
     conn = sqlite3.connect("medicines.db")
-    conn.row_factory = sqlite3.Row  # Чтобы результаты были словарями
+    conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db()
+    # ⚠️ Структура БД — БЕЗ ИЗМЕНЕНИЙ, как в оригинале
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,51 +42,74 @@ def init_db():
             is_taken INTEGER DEFAULT 0
         );
     """)
-
     conn.commit()
     conn.close()
 
 init_db()
 
-@app.get("/api/medicines")
-def get_medicines(request: Request):
-    init_data = request.headers.get("X-Telegram-InitData")
-    # if not init_data:
-    #     raise HTTPException(400, "Отсутствует initData")
+async def get_user_id_from_request(request: Request) -> int:
+    """Извлекаем user_id из JSON-тела запроса"""
+    try:
+        body = await request.json()
+        user_id = body.get("user_id")
+        if not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be positive integer")
+        return user_id
+    except Exception:
+        raise HTTPException(status_code=400, detail="Отсутствует или некорректный user_id в теле запроса")
 
-    parsed = verify_telegram_init_data(init_data)
-    user_info = json.loads(parsed["user"])
-    user_id = user_info["id"]
+@app.get("/api/medicines")
+async def get_medicines(request: Request):
+    user_id = await get_user_id_from_request(request)
 
     conn = get_db()
-    rows = conn.execute(
-        "SELECT id, name FROM users WHERE user_id = ?", 
-        (user_id,)
-    ).fetchall()
+    # JOIN с days, чтобы получить is_taken. 
+    # Используем LEFT JOIN — если записи в days нет, считаем is_taken=0
+    rows = conn.execute("""
+        SELECT 
+            m.medicines_id AS id,
+            m.name,
+            m.count AS scheduled_time,
+            COALESCE(d.is_taken, 0) AS is_taken
+        FROM medicines m
+        LEFT JOIN days d ON m.medicines_id = d.data_medicines_id
+        WHERE m.user_id = ?
+    """, (user_id,)).fetchall()
     conn.close()
     
-    # Преобразуем строки БД в список словарей для JSON
     return [dict(row) for row in rows]
 
 @app.post("/api/medicines/{medicine_id}/mark")
-def mark_medicine(medicine_id: int, request: Request):
-    init_data = request.headers.get("X-Telegram-InitData")
-    if not init_data:
-        raise HTTPException(400, "Отсутствует initData")
-
-    parsed = verify_telegram_init_data(init_data)
-    user_info = json.loads(parsed["user"])
-    user_id = user_info["id"]
+async def mark_medicine(medicine_id: int, request: Request):
+    user_id = await get_user_id_from_request(request)
 
     conn = get_db()
-    # Переключаем 0 ↔ 1
-    cur = conn.execute(
-        "UPDATE medicines SET is_taken = 1 - is_taken WHERE id = ? AND user_id = ?",
+    
+    # Проверяем, что лекарство принадлежит пользователю
+    med = conn.execute(
+        "SELECT medicines_id FROM medicines WHERE medicines_id = ? AND user_id = ?",
         (medicine_id, user_id)
+    ).fetchone()
+    
+    if not med:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Лекарство не найдено или доступно не вам")
+    
+    # Обновляем is_taken в таблице days (UPSERT: INSERT OR REPLACE)
+    # Сначала читаем текущее значение
+    cur = conn.execute(
+        "SELECT is_taken FROM days WHERE data_medicines_id = ?",
+        (medicine_id,)
+    ).fetchone()
+    
+    new_value = 0 if cur and cur[0] == 1 else 1
+    
+    # Используем INSERT OR REPLACE для простоты (SQLite)
+    conn.execute(
+        "INSERT OR REPLACE INTO days (data_medicines_id, is_taken) VALUES (?, ?)",
+        (medicine_id, new_value)
     )
     conn.commit()
     conn.close()
 
-    if cur.rowcount == 0:
-        raise HTTPException(404, "Лекарство не найдено или доступно не вам")
     return {"status": "ok"}
