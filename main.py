@@ -78,7 +78,7 @@ def get_medicines(request: Request):
 
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, name FROM medicines WHERE user_id = ?", 
+        "SELECT id, name FROM users WHERE user_id = ?", 
         (user_id,)
     ).fetchall()
     conn.close()
